@@ -2,9 +2,11 @@
 #include <RF24.h>
 #include <U8g2lib.h>
 #include <Bounce2.h>
+#include <EEPROM.h>
+#include <CRC32.h>
 
 //U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
 
 #define DIP0 A3
 #define DIP1 10
@@ -13,9 +15,12 @@ U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basi
 
 #define PWM_OUTPUT 3
 
-#define BTN_UP A0
-#define BTN_DOWN A1
+#define BTN_UP A1
+#define BTN_DOWN A0
 #define BTN_SELECT A2
+#define MENU_LEFT_ICON 0, 64
+#define MENU_MIDDLE_ICON 62, 64
+#define MENU_RIGHT_ICON 120, 64
 
 Bounce2::Button btnUp = Bounce2::Button();
 Bounce2::Button btnDown = Bounce2::Button();
@@ -36,13 +41,54 @@ const byte address[6] = "52351";
 struct {
   bool redraw : 1;
   uint8_t screen: 2;
-  uint8_t mode: 2;
 } operation;
 
-
 uint8_t powerOutput;
-uint8_t powerSet;
+uint8_t powerRadio;
 
+
+struct __attribute__((packed)) StoreData {
+  uint8_t addressProtocol;
+  uint8_t fadeSpeed;
+  uint8_t mode;
+  uint8_t powerSet;
+};
+
+StoreData data;
+
+// Function to calculate CRC32 for the struct
+uint32_t calculateCRC(const StoreData& data) {
+  CRC32 crc;
+  crc.update((const uint8_t*)&data, sizeof(data)); // Calculate CRC from the bytes of the struct
+  return crc.finalize(); // Return the final CRC32 value
+}
+
+
+void configSave() {
+  int32_t crc = calculateCRC(data);
+  EEPROM.put(0, data);           // Write struct at address 0
+  EEPROM.put(sizeof(data), crc); // Write CRC checksum after the struct
+}
+
+void configLoad() {
+  EEPROM.begin();
+  EEPROM.get(0, data);
+
+  uint32_t crc = calculateCRC(data);
+  uint32_t savedCRC;
+  EEPROM.get(sizeof(data), savedCRC);
+  
+  if (savedCRC != crc || data.mode > 2 ) {
+    Serial.print("inilizing EEPROM.");
+    data.mode = MODE_AUTO;
+    data.addressProtocol = 0;
+    data.fadeSpeed = 1;
+    data.powerSet = 0;
+    configSave();
+  } else {
+    Serial.println("EEPROM is ok.");
+  }
+}
 
 struct __attribute__((packed)) RemoteLight {
     unsigned long time;
@@ -50,44 +96,40 @@ struct __attribute__((packed)) RemoteLight {
     uint8_t power;
 };
 
-
 struct MenuItem {
   const char* label;
-  const uint8_t* value;
+  uint8_t* value;
   const uint8_t min_value;
   const uint8_t max_value;
-  MenuItem(const char* label, const uint8_t* value, const uint8_t min_value, const uint8_t max_value) : 
+  MenuItem(const char* label, uint8_t* value, const uint8_t min_value, const uint8_t max_value) : 
     label(label), 
     value(value), 
     min_value(min_value), 
     max_value(max_value) {}
 };
 
-uint8_t protocolAddress;
-uint8_t speedFade;
-
 uint8_t currentItem;
 
-const MenuItem menu[] = {
-  MenuItem("Address", &protocolAddress, 1, 254),
-  MenuItem("Fade speed", &speedFade, 1, 10),
+const MenuItem menu[]  = {
+  MenuItem("Address", &data.addressProtocol, 1, 254),
+  MenuItem("Fade speed", &data.fadeSpeed, 1, 10),
   MenuItem("Exit", NULL, 0, 0)
 };
+#define MENU_LENGTH 3
 
-
-bool pinOnTimer = false;
+char printBuff[16] = {0};
 
 void setup()
 {
+  Serial.begin(9600);
+  Serial.println("Startup");
+
+  configLoad();
   powerOutput = 0;
-  powerSet = 0;
+  powerRadio = 0;
   operation.redraw = 0;
   currentItem = 0;
   operation.screen = SCREEN_MAIN;
-  operation.mode = MODE_AUTO;
-
-  Serial.begin(9600);
-  Serial.println("Hello, Serial Console!");
 
   btnUp.attach(BTN_UP, INPUT_PULLUP); 
   btnUp.interval(5); // debounce interval in milliseconds
@@ -149,14 +191,11 @@ void setup()
     radio.enableAckPayload();
     radio.enableDynamicPayloads();
     radio.startListening();
-    u8g2.setFont(u8g2_font_open_iconic_www_2x_t);
-    u8g2.drawStr(0, 16, "\x48");  // Draw text
   }
   Serial.println("Radio setup is done");
-
-  u8g2.sendBuffer();
   analogWrite(PWM_OUTPUT, 0);
 
+  operation.redraw = true;
   Serial.println("Setup is done");
 }
 
@@ -167,57 +206,23 @@ void check_events(void) {
   btnSelect.update();
 }
 
-/*
-void print_power(uint8_t power) {
-  char powerLine[32];
-  snprintf(powerLine, sizeof(powerLine), "Power: %i%%", 100 * power / 255 );
-  u8g2.setCursor(0, 20);
-  u8g2.print(powerLine);
-  u8g2.sendBuffer();
-}
-*/;
-
-int loop_idx = 0;
-
-
-
-
-void handle_events(void) {
-  // 0 = not pushed, 1 = pushed  
-  /*
-  if (selectBtn.pressed()) {
-    if (!mui.isFormActive()) {
-      mui.gotoForm(form_id=1, initial_cursor_position=0);
-    } else {
-      mui.sendSelect();
-    }
-    is_redraw = 1;
-  } else if (nextBtn.pressed()) {
-    if (!mui.isFormActive()) {
-      loop_idx ++;
-    } else {
-
-    }
-    is_redraw = 1;
-  }
-  else if (prevBtn.pressed()) {
-    loop_idx --;
-    is_redraw = 1;
-  }    
-  */
-}
-
 
 void ui_main() {
   if (btnUp.pressed()) {
-    if (operation.mode < MODE_ON) {
-      operation.mode ++;
+    if (data.mode < MODE_ON) {
+      data.mode ++;
+      configSave();
+      operation.redraw = true;
+      Serial.println("Main UP");
     }
   }
 
   if (btnDown.pressed()) {
-    if (operation.mode > 0) {
-      operation.mode --;
+    if (data.mode > 0) {
+      data.mode --;
+      configSave();
+      operation.redraw = true;
+      Serial.println("Main Down");
     }
   }
 
@@ -225,18 +230,26 @@ void ui_main() {
     operation.screen = SCREEN_MENU;
     currentItem = 0;
     operation.redraw = true;
+    Serial.println("Main enter");
     return;
   }
 
-  u8g2.firstPage();
+  if (!operation.redraw) {
+    return;
+  }
 
+  Serial.println("Main redraw");
+
+
+  u8g2.clearBuffer();
+  u8g2.firstPage();
   do {
     // Draw Radio
     u8g2.setFont(u8g2_font_open_iconic_www_2x_t);
     u8g2.drawStr(0, 16, "\x48");  // Draw text
 
     // Draw mode
-    switch (operation.mode) {
+    switch (data.mode) {
       case MODE_AUTO:
         u8g2.setFont(u8g2_font_open_iconic_arrow_2x_t);
         u8g2.drawStr(64, 16, "\x57");
@@ -244,28 +257,29 @@ void ui_main() {
       case MODE_ON:
         u8g2.setFont(u8g2_font_open_iconic_check_2x_t);
         u8g2.drawStr(64, 16, "\x41");
-        powerSet = 255;
+        data.powerSet = 255;
         break;
       case MODE_OFF:
         u8g2.setFont(u8g2_font_open_iconic_check_2x_t);
         u8g2.drawStr(64, 16, "\x42");
-        powerSet = 0;
+        data.powerSet = 0;
         break;
     }
 
-    char powerLine[64] = {0};
-
-    snprintf(powerLine, sizeof(powerLine), "C:%i T:%i ", powerOutput, powerSet);
+    memset(printBuff, '\0', sizeof(printBuff));
+    snprintf(printBuff, sizeof(printBuff), "C:%i T:%i ", powerOutput, data.powerSet);
     u8g2.setFont(u8g2_font_ncenB08_tr);
     u8g2.setCursor(0, 32);
-    u8g2.print(powerLine); 
+    u8g2.print(printBuff); 
   } while ( u8g2.nextPage() );
+  Serial.println("Main redraw 3");
+  operation.redraw = false;
 }
 
-void ui_menu() {
 
+void ui_menu() {
   if (btnUp.pressed()) {
-    if (currentItem < sizeof(menu)-2) {
+    if (currentItem < MENU_LENGTH - 1) {
       currentItem ++;
       operation.redraw = true;
     }
@@ -281,6 +295,11 @@ void ui_menu() {
   if (btnSelect.pressed()) {
     if (!menu[currentItem].value) {
       operation.screen = SCREEN_MAIN;
+      operation.redraw = true;
+      return;
+    } else {
+      operation.screen = SCREEN_PARAMETER;
+      operation.redraw = true;
       return;
     }
   }
@@ -288,6 +307,7 @@ void ui_menu() {
   if (!operation.redraw) {
     return;
   }
+  Serial.println("Menu redraw");
 
   const MenuItem current = menu[currentItem];
 
@@ -296,23 +316,112 @@ void ui_menu() {
 
   do {
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.setCursor(0, 64);
-    u8g2.print("Menu");
+    u8g2.setCursor(32, 25);
+    u8g2.print("M E N U");
 
-    u8g2.setCursor(16, 32);
+    u8g2.setCursor(16, 40);
     u8g2.print(current.label);
+ 
+    u8g2.setFont(u8g2_font_open_iconic_arrow_1x_t);
+    if (currentItem > 0) {
+        u8g2.drawStr(MENU_LEFT_ICON, "\x51");
+    }
+    
+    if (currentItem < MENU_LENGTH - 1) {
+        u8g2.drawStr(MENU_MIDDLE_ICON, "\x52");
+    }
+
+    if (!menu[currentItem].value) { 
+      u8g2.drawStr(MENU_RIGHT_ICON, "\x5A");
+    } else { 
+      u8g2.drawStr(MENU_RIGHT_ICON, "\x53");
+    }
 
   } while ( u8g2.nextPage() );
   operation.redraw = false;
 }
 
-void ui_parameter() {
 
+void ui_parameter() {
+  if (btnUp.pressed()) {
+    if (*menu[currentItem].value < menu[currentItem].max_value) {
+      (*menu[currentItem].value)++;
+      operation.redraw = true;
+      Serial.println("Parameter Up");
+    }
+  }
+  if (btnDown.pressed()) {
+    if (*menu[currentItem].value > menu[currentItem].min_value) {
+      (*menu[currentItem].value)--;
+      operation.redraw = true;
+      Serial.println("Parameter Down");
+    }
+  }
+
+  if (btnSelect.pressed()) {
+    configSave();
+    operation.screen = SCREEN_MENU;
+    operation.redraw = true;
+    Serial.println("Parameter Select");
+    return;
+  }
+
+  if (!operation.redraw) {
+    return;
+  }
+  
+  Serial.println("Parameter redraw");
+  const MenuItem current = menu[currentItem];
+
+  memset(printBuff, '\0', sizeof(printBuff));
+  snprintf(printBuff, sizeof(printBuff), "%i", *menu[currentItem].value);
+
+  u8g2.firstPage();
+  u8g2.clearBuffer();
+  do {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.setCursor(16, 32);
+    u8g2.print(current.label);
+
+    u8g2.setCursor(16, 48);
+    u8g2.print(printBuff); 
+
+
+    if (*menu[currentItem].value < menu[currentItem].max_value) {
+      u8g2.drawStr(MENU_MIDDLE_ICON, "+");
+    }
+    if (*menu[currentItem].value > menu[currentItem].min_value) {
+      u8g2.drawStr(MENU_LEFT_ICON, "-");
+    }
+    u8g2.setFont(u8g2_font_open_iconic_arrow_1x_t);
+    u8g2.drawStr(MENU_RIGHT_ICON, "\x5A");
+
+  } while ( u8g2.nextPage() );
+  operation.redraw = false;
 }
  
 
 void loop(void) {
   check_events(); // check for button press with bounce2 library
+
+  if (data.mode == MODE_AUTO) {
+    data.powerSet = powerRadio;
+  }
+
+  if (powerOutput < data.powerSet) {
+    powerOutput ++;
+    if (operation.screen == SCREEN_MAIN) {
+      operation.redraw = true;
+    }
+
+  } else if (powerOutput > data.powerSet) {
+    powerOutput --;
+    if (operation.screen == SCREEN_MAIN) {
+      operation.redraw = true;
+    }
+  }
+
+  analogWrite(PWM_OUTPUT, powerOutput);
 
   switch (operation.screen) {
     case SCREEN_MAIN:
@@ -326,62 +435,18 @@ void loop(void) {
       break;
   }
 
-  //handle_events();  // process events from bounce2 library
-
-  char powerLine[64] = {0};
-  int has_data = 0;
-
   if (radio.available()) {
     Serial.println("Data is available");
 
     RemoteLight data;
     radio.read(&data, sizeof(data));
-    has_data = 1;
     
-    Serial.println(powerLine);
-
-    /*display.setCursor(0, 8);
-    display.fillRect(0, 8, SCREEN_WIDTH, 8, SSD1306_BLACK);
-    display.print(line);
-    display.display();  
-    */
- 
     if (data.power == 100) {
-      /* 
-      digitalWrite(9, HIGH);
-      pinOnTimer = false;
-      print_power(255); 
-      */
-      analogWrite(3, 255);
+      powerRadio = 255; 
     } else if (data.power == 0) {
-      /* 
-      digitalWrite(9, LOW);
-      pinOnTimer = false;
-      print_power(0);
-      */
-      analogWrite(3, 0);
+      powerRadio = 0; 
     } else {
-      /*
-      if (!pinOnTimer) {
-        TCCR1A |= _BV(COM1A1) | _BV(WGM10);
-        pinOnTimer = true;
-      }
-      */
-      uint8_t power = 255.0 / 100.0 * (float)data.power;
-      // OCR1A = power;
-      Serial.println(power);
-      //print_power(power);
-      analogWrite(3, power);
+      powerRadio = 255.0 / 100.0 * (float)data.power;
     }
   }
-
-  if (powerOutput < powerSet) {
-    powerOutput ++;
-  } else if (powerOutput > powerSet) {
-    powerOutput --;
-  }
-
-  analogWrite(PWM_OUTPUT, powerOutput);
-
-
 }

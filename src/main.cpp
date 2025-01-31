@@ -4,6 +4,7 @@
 #include <Bounce2.h>
 #include <EEPROM.h>
 #include <CRC32.h>
+#include <Wire.h>
 
 //U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
@@ -29,7 +30,7 @@ Bounce2::Button btnSelect = Bounce2::Button();
 
 RF24 radio(10, 9); // CE, CSN
 
-const byte address[6] = "52351";
+byte address[6] = "52350";
 
 #define SCREEN_MAIN 0
 #define SCREEN_MENU 1
@@ -45,13 +46,15 @@ struct {
 
 uint8_t powerOutput;
 uint8_t powerRadio;
-
+uint16_t luxValue;
+uint8_t luxSimple;
 
 struct __attribute__((packed)) StoreData {
   uint8_t addressProtocol;
   uint8_t fadeSpeed;
   uint8_t mode;
   uint8_t powerSet;
+  uint8_t lowLightThreshould;
 };
 
 StoreData data;
@@ -113,11 +116,25 @@ uint8_t currentItem;
 const MenuItem menu[]  = {
   MenuItem("Address", &data.addressProtocol, 1, 254),
   MenuItem("Fade speed", &data.fadeSpeed, 1, 10),
+  MenuItem("Low light", &data.lowLightThreshould, 0, 255),
   MenuItem("Exit", NULL, 0, 0)
 };
 #define MENU_LENGTH 3
 
-char printBuff[16] = {0};
+char printBuff[20] = {0};
+
+void initRfReading() {
+  address[sizeof(address)-1] = '0' + data.addressProtocol;
+  radio.setChannel(23);
+  radio.openReadingPipe(1, address);
+  radio.setPALevel(RF24_PA_MIN);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setCRCLength(RF24_CRC_8);
+  radio.enableAckPayload();
+  radio.enableDynamicPayloads();
+  radio.startListening();
+
+}
 
 void setup()
 {
@@ -182,21 +199,22 @@ void setup()
     while (1){};
   } else {
     Serial.println("Radio is connected");
-
-    radio.setChannel(23);
-    radio.openReadingPipe(1, address);
-    radio.setPALevel(RF24_PA_MIN);
-    radio.setDataRate(RF24_250KBPS);
-    radio.setCRCLength(RF24_CRC_8);
-    radio.enableAckPayload();
-    radio.enableDynamicPayloads();
-    radio.startListening();
+    initRfReading();
   }
   Serial.println("Radio setup is done");
-  analogWrite(PWM_OUTPUT, 0);
+  analogWrite(PWM_OUTPUT, 0); 
 
   operation.redraw = true;
   Serial.println("Setup is done");
+
+  Wire.beginTransmission(0x44);
+  Wire.write(0x01);
+  //Wire.write(0b11001100);
+  //Wire.write(0b00000000);
+  Wire.write(0b10011100);  // 5.12 lux/bit + 
+  Wire.write(0b00000100);  // ME=1
+  Wire.endTransmission(true);
+
 }
 
 
@@ -271,6 +289,18 @@ void ui_main() {
     u8g2.setFont(u8g2_font_ncenB08_tr);
     u8g2.setCursor(0, 32);
     u8g2.print(printBuff); 
+
+    memset(printBuff, '\0', sizeof(printBuff));
+    snprintf(printBuff, sizeof(printBuff), "Lux:%u", luxValue);
+    u8g2.setCursor(0, 42);
+    u8g2.print(printBuff); 
+
+    if (luxSimple > data.lowLightThreshould) {
+      u8g2.drawStr(100, 42, "S");
+    } else {
+      u8g2.drawStr(100, 42, "F");
+    }
+
   } while ( u8g2.nextPage() );
   Serial.println("Main redraw 3");
   operation.redraw = false;
@@ -279,7 +309,7 @@ void ui_main() {
 
 void ui_menu() {
   if (btnUp.pressed()) {
-    if (currentItem < MENU_LENGTH - 1) {
+    if (currentItem < MENU_LENGTH) {
       currentItem ++;
       operation.redraw = true;
     }
@@ -327,7 +357,7 @@ void ui_menu() {
         u8g2.drawStr(MENU_LEFT_ICON, "\x51");
     }
     
-    if (currentItem < MENU_LENGTH - 1) {
+    if (currentItem < MENU_LENGTH) {
         u8g2.drawStr(MENU_MIDDLE_ICON, "\x52");
     }
 
@@ -360,6 +390,7 @@ void ui_parameter() {
 
   if (btnSelect.pressed()) {
     configSave();
+    initRfReading();
     operation.screen = SCREEN_MENU;
     operation.redraw = true;
     Serial.println("Parameter Select");
@@ -401,6 +432,42 @@ void ui_parameter() {
 }
  
 
+uint32_t convertToLux(uint16_t resultRegister) {
+    // Extract exponent (E[3:0]) and mantissa (R[11:0]) from the result register
+    uint8_t exponent = (resultRegister >> 12) & 0x0F;  // Bits 15:12
+    uint16_t mantissa = resultRegister & 0x0FFF;       // Bits 11:0
+
+    // Calculate lux: lux = 0.01 × (2^exponent) × mantissa
+    uint32_t lux = (uint32_t)(0.01 * (1 << exponent) * mantissa); 
+
+    return lux;
+}
+
+#define OPT3001_ADDRESS 0x44 
+#define RESULT_REGISTER 0x00
+
+// Function to read the result register from OPT3001
+uint16_t readResultRegister() {
+    uint16_t result = 0;
+
+    // Start communication
+    Wire.beginTransmission(OPT3001_ADDRESS);
+    Wire.write(RESULT_REGISTER); // Request the result register
+    Wire.endTransmission(false); // Restart communication without releasing the bus
+
+    // Request 2 bytes of data from the sensor
+    Wire.requestFrom(OPT3001_ADDRESS, 2);
+
+    if (Wire.available() == 2) { // Ensure we received 2 bytes
+        uint8_t msb = Wire.read(); // Read the most significant byte
+        uint8_t lsb = Wire.read(); // Read the least significant byte
+        result = (msb << 8) | lsb; // Combine the two bytes into a 16-bit value
+    }
+
+    return result;
+}
+
+
 void loop(void) {
   check_events(); // check for button press with bounce2 library
 
@@ -421,7 +488,6 @@ void loop(void) {
     }
   }
 
-  analogWrite(PWM_OUTPUT, powerOutput);
 
   switch (operation.screen) {
     case SCREEN_MAIN:
@@ -448,5 +514,23 @@ void loop(void) {
     } else {
       powerRadio = 255.0 / 100.0 * (float)data.power;
     }
+  }
+  Serial.println("-------------"); 
+  Serial.println("Sensor"); 
+
+  luxValue = readResultRegister();
+  operation.redraw = true;
+  Serial.print("Lux value: ");
+  Serial.println(luxValue);
+  Serial.println("-------------"); 
+
+  luxSimple = (luxValue & 0xFF00) >> 8;
+  Serial.print("Lux simple: ");
+  Serial.println(luxSimple);
+  Serial.println("-------------"); 
+  if (luxSimple > data.lowLightThreshould) {
+    analogWrite(PWM_OUTPUT, 0);
+  } else {
+    analogWrite(PWM_OUTPUT, powerOutput);
   }
 }
